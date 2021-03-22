@@ -415,13 +415,11 @@ if __name__ == '__main__':
     main()
 
 """ TODO
-Rebalance the train/val/test sets, re-add augmentation
-Print statistics on the sets composition
 can you have TB logs for the tuner trials?
 Maximise dynamic range during pre-processing
 run overnight
 Try different neural nets
-Modelate the classification threshold to choose an F1 or precision/recall tradeoff (do it with inference only, in a notebook)
+Modulate the classification threshold to choose an F1 or precision/recall tradeoff (do it with inference only, in a notebook)
 Check "Transfer Learning with Deep Convolutional Neural Network (CNN) for Pneumonia Detection using Chest X-ray"
 https://arxiv.org/abs/2004.06578
 """
