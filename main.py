@@ -26,7 +26,47 @@ val_batch_size = 256
 n_classes = 1
 patience = 10
 epochs = 20
-augmentation = 3
+augmentation = 4
+pos_to_neg_rate_on_test = 1.
+
+
+def split_dataset2(metadata):
+    split1_metadata, split2_metadata = train_test_split(metadata,
+                                                        test_size=.5,
+                                                        random_state=seed,
+                                                        stratify=metadata['Pneumonia'])
+
+    return split1_metadata, split2_metadata
+
+
+def shuffle_DataFrame(df, seed=None):
+    df = df.sample(n=len(df), replace=False, random_state=seed)
+    return df
+
+
+def keep_n_negative_samples(dataframe, n_wanted):
+    ''' Remove enough negative samples, choosen at random, from the dataset, in order to obtain a dataset with the
+    requested number of negative samples'''
+    assert int(n_wanted) == n_wanted
+    # Compile a dataframe with all the negative samples (of the train set)
+    non_pneumonia = dataframe[dataframe['Pneumonia'] == 0].copy()  # Make a copy, don't take a copy of a slice
+    # Choose enough of them, stratifying over the fact that the samples have other findings, different from pneumonia
+    non_pneumonia['Other Findings'] = non_pneumonia['Finding Labels'] != 'No Finding'
+    non_pneumonia_sampled, _ = train_test_split(non_pneumonia,
+                                                train_size=int(n_wanted),
+                                                random_state=seed,
+                                                stratify=non_pneumonia['Other Findings'])
+    pneumonia = dataframe[dataframe['Pneumonia'] == 1]
+    result = pd.concat([pneumonia, non_pneumonia_sampled], axis=0, ignore_index=True)
+    # The 'Other Findings' column is not needed anymore
+    result.drop('Other Findings', axis=1, inplace=True)
+    # Shuffle the rows of the result
+    result = shuffle_DataFrame(result, seed)
+
+    assert sum(result['Pneumonia'] == 0) == n_wanted
+    assert sum(result['Pneumonia']) == sum(dataframe['Pneumonia'])
+
+    return result
 
 
 def split_dataset(metadata, neg_to_pos_ratio):
@@ -49,32 +89,24 @@ def split_dataset(metadata, neg_to_pos_ratio):
                                                     random_state=seed,
                                                     stratify=dev_patients)
     # The patient IDs are still in the indices of the respective series
-    train_metadata = metadata.iloc[train_patients.index]
-    val_metadata = metadata.iloc[val_patients.index]
-    test_metadata = metadata.iloc[test_patients.index]
-
+    train_metadata = metadata[metadata['Patient ID'].isin(train_patients.index)]
+    val_metadata = metadata[metadata['Patient ID'].isin(val_patients.index)]
+    test_metadata = metadata[metadata['Patient ID'].isin(test_patients.index)]
+    assert len(train_metadata) + len(val_metadata) + len(test_metadata) == len(metadata)
+    assert sum(train_metadata['Pneumonia']) + sum(val_metadata['Pneumonia']) + sum(test_metadata['Pneumonia']) == sum(
+        metadata['Pneumonia'])
+    assert set(train_metadata['Patient ID']).isdisjoint(set(val_metadata['Patient ID']))
+    assert set(train_metadata['Patient ID']).isdisjoint(set(test_metadata['Patient ID']))
+    assert set(val_metadata['Patient ID']).isdisjoint(set(test_metadata['Patient ID']))
     # The number of positive samples currently in the train set
     train_n_pos = np.sum(train_metadata['Pneumonia'])
     # The number of negative samples wanted for the train set
     wanted_neg = min(train_n_pos * neg_to_pos_ratio, len(train_metadata) - train_n_pos)
 
-    ''' Sample and remove enough negative samples from the train set to obtain a train set balanced between positive and
-    negative samples '''
-    # TODO Should I do this at a patient (not sample) level?
-    # Compile a dataframe with all the negative samples (of the train set)
-    non_pneumonia = train_metadata[train_metadata['Pneumonia'] == 0].copy()  # Make a copy, don't take a copy of a slice
-    # Choose enough of them, stratifying over the fact that the samples have other findings, different from pneumonia
-    non_pneumonia['Other Findings'] = non_pneumonia['Finding Labels'] != 'No Finding'
-    non_pneumonia_sampled, _ = train_test_split(non_pneumonia,
-                                                train_size=wanted_neg,
-                                                random_state=seed,
-                                                stratify=non_pneumonia['Other Findings'])
-    pneumonia = train_metadata[train_metadata['Pneumonia'] == 1]
-    train_metadata = pd.concat([pneumonia, non_pneumonia_sampled], axis=0, ignore_index=True)
-    # The 'Other Findings' column is not needed anymore
-    train_metadata.drop('Other Findings', axis=1, inplace=True)
-    # Shuffle the rows of the result
-    train_metadata = train_metadata.sample(n=len(train_metadata), replace=False, random_state=seed)
+    train_metadata = keep_n_negative_samples(train_metadata, wanted_neg)
+    val_metadata = keep_n_negative_samples(val_metadata, sum(val_metadata['Pneumonia']) / pos_to_neg_rate_on_test)
+    test_metadata = keep_n_negative_samples(test_metadata, sum(test_metadata['Pneumonia']) / pos_to_neg_rate_on_test)
+
     return train_metadata, val_metadata, test_metadata
 
 
@@ -292,20 +324,34 @@ def load_metadata():
 
 def main():
     metadata = load_metadata()
-    metadata2_train, metadata2_test = load_metadata2()
+    # train_metadata2, test_metadata2 = load_metadata2()
+
+    ''' Fraction of positive samples wanted in both test and validation set, the same as it is in the test set of 
+    the Kaggle Chest X-Ray Images (Pneumonia) dataset'''
 
     train_metadata, val_metadata, test_metadata = split_dataset(metadata, augmentation + 1)
     # train_metadata = train_metadata.head(8)
     # val_metadata = val_metadata.head(256)
 
-    metadata2 = load_metadata2()
+    if augmentation > 0:
+        pos_train_metadata = train_metadata[train_metadata['Pneumonia'] == 1]
+        neg_train_metadata = train_metadata[train_metadata['Pneumonia'] == 0]
+        pos_train_metadata_augmented = augment(metadata=pos_train_metadata, rate=augmentation, batch_size=16, seed=seed)
+        train_metadata = pd.concat([pos_train_metadata, pos_train_metadata_augmented, neg_train_metadata],
+                                   ignore_index=True)
+    # train_metadata = pd.concat(([train_metadata, train_metadata2]), ignore_index=True)
+    train_metadata = shuffle_DataFrame(train_metadata, seed)
 
-    pos_train_metadata = train_metadata[train_metadata['Pneumonia'] == 1]
-    neg_train_metadata = train_metadata[train_metadata['Pneumonia'] == 0]
-    pos_train_metadata_augmented = augment(metadata=pos_train_metadata, rate=augmentation, batch_size=16, seed=seed)
-    train_metadata = pd.concat([pos_train_metadata, pos_train_metadata_augmented, neg_train_metadata],
-                               ignore_index=True)
-    train_metadata = train_metadata.sample(n=len(train_metadata), replace=False, random_state=seed)
+    """val_metadata2, test_metadata2 = split_dataset2(test_metadata2)
+    val_metadata = pd.concat(([val_metadata, val_metadata2]), ignore_index=True)
+    test_metadata = pd.concat(([test_metadata, test_metadata2]), ignore_index=True)"""
+
+    print('Train:')
+    print(Counter(train_metadata['Pneumonia']))
+    print('Validation:')
+    print(Counter(val_metadata['Pneumonia']))
+    print('Test:')
+    print(Counter(test_metadata['Pneumonia']))
 
     train_ds = make_pipeline(file_paths=train_metadata['File Path'].to_numpy(),
                              y=train_metadata['Pneumonia'].to_numpy(),
@@ -316,9 +362,6 @@ def main():
                            y=val_metadata['Pneumonia'].to_numpy(),
                            shuffle=False,
                            batch_size=val_batch_size)
-
-    # model = make_model()
-    # model.summary()
 
     samples_ds = make_pipeline(file_paths=train_metadata['File Path'].to_numpy(),
                                y=train_metadata['Pneumonia'].to_numpy(),
@@ -340,15 +383,15 @@ def main():
                       max_epochs=epochs,
                       hyperband_iterations=2,
                       directory='computations',
-                      project_name='base_model-aug3-auc')
+                      project_name='base_model-1datasets-aug4-auc')
 
     early_stopping_cb = tf.keras.callbacks.EarlyStopping(monitor='val_auc', patience=patience)
 
-    """tuner.search(x=train_ds,
+    tuner.search(x=train_ds,
                  validation_data=val_ds,
                  epochs=epochs,
                  shuffle=False,
-                 callbacks=[early_stopping_cb])"""
+                 callbacks=[early_stopping_cb])
 
     model_maker = ModelMaker(tuner)
 
@@ -357,7 +400,7 @@ def main():
                          max_epochs=epochs,
                          hyperband_iterations=2,
                          directory='computations',
-                         project_name='fine_tuning-aug3-auc')
+                         project_name='fine_tuning-1datasets-aug4-auc')
 
     early_stopping_cb = tf.keras.callbacks.EarlyStopping(monitor='val_auc', patience=patience)
 
@@ -372,7 +415,13 @@ if __name__ == '__main__':
     main()
 
 """ TODO
+Rebalance the train/val/test sets, re-add augmentation
+Print statistics on the sets composition
+can you have TB logs for the tuner trials?
 Maximise dynamic range during pre-processing
+run overnight
+Try different neural nets
+Modelate the classification threshold to choose an F1 or precision/recall tradeoff (do it with inference only, in a notebook)
 Check "Transfer Learning with Deep Convolutional Neural Network (CNN) for Pneumonia Detection using Chest X-ray"
 https://arxiv.org/abs/2004.06578
 """
