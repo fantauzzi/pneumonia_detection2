@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 from collections import Counter
+import pickle
+import logging
 import datetime
 import numpy as np
 import tensorflow as tf
@@ -30,6 +32,7 @@ epochs_base = 2
 epochs_ft = 2
 augmentation = 4
 pos_to_neg_rate_on_test = 1.
+n_folds = 5
 
 
 def split_dataset2(metadata):
@@ -216,7 +219,10 @@ class ModelMaker:
         return model
 
     def make_model_DenseNet121(self, hp):
-        learning_rate = hp.Float('learning_rate', 1e-5, 1e-4, sampling='log')
+        learning_rate = hp['learning_rate'] if isinstance(hp, dict) else hp.Float('learning_rate',
+                                                                                  1e-5,
+                                                                                  1e-4,
+                                                                                  sampling='log')
 
         model = self.tuner.get_best_models(num_models=1)[0]
 
@@ -231,14 +237,15 @@ class ModelMaker:
             if match is not None:
                 block_ends.append(i)
                 block_end_names.append(layer.name)
-        last_frozen_layer = hp.Int('last_frozen_layer', 0, len(block_ends) - 1)
+        last_frozen_layer = hp['last_frozen_layer'] if isinstance(hp, dict) else hp.Int('last_frozen_layer',
+                                                                                        0,
+                                                                                        len(block_ends) - 1)
 
         for i in range(block_ends[last_frozen_layer]):
             base_model.layers[i].trainable = False
 
         compile_model(model, learning_rate)
         return model
-
 
 
 def show_samples(dataset):
@@ -369,6 +376,152 @@ def load_metadata():
     return metadata
 
 
+def make_logger(name, log_level):
+    """
+    Initializes and return a logger. See https://docs.python.org/3/library/logging.html
+    :param name: the name for the logger, a string.
+    :param log_level: the requested log level, as documented in https://docs.python.org/3/library/logging.html#levels
+    :return: an instance of logging.Logger
+    """
+    logger = logging.getLogger(name)
+    logger.handlers = []
+    logger.setLevel(log_level)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s: %(levelname)s %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    return logger
+
+
+def make_k_fold_file_name(stem):
+    """
+    Returns the pickle file name for a given stem.
+    :param stem: the given stem, a string.
+    :return: the pickle file name.
+    """
+    fname = stem + '_kfold.pickle'
+    return fname
+
+
+def keep_last_two_files(file_name):
+    if Path(file_name).is_file():
+        Path(file_name).replace(file_name + '.prev')
+    Path(file_name + '.tmp').replace(file_name)
+
+
+def k_fold_resumable_fit(model_maker, hp, comp_dir, project, train_datasets, val_datasets, log_dir,
+                         log_level=logging.INFO,
+                         **kwargs):
+    """
+    Performs k-fold cross validation of a Keras model, training and validating the model k times. The dataset
+    partitioning in k folds is the responsibility of the client code, to be performed in a callback passed to the
+    function, see parameter `make_datasets_cb`.
+
+    :param model: the Keras model. In doesn't need to be compiled, as the function will take care of it. If a previous
+    training and validation process on the same model has been interrupted, but its state was saved in files, then the
+    function will load the model from files and resume training and validation, and this parameter will be ignored,
+     it can be set to None.
+    :param comp_dir: path to the directory where the training state will be saved, a string.
+    :param stem: a stem that will be used to make file names to save the computation state and its results, a string.
+    :param compile_cb: a function that will be called to build the Keras model as necessary. It must take one
+    argument, which is the model to be compiled; anything it returns is ignored.
+    :param make_datasets_cb: a function or method that instantiates the training and validation pipelines.
+    It takes three parameters: the fold number, a non-negative integer, the total number of folds, a positive
+    integer, and **kwargs, as passed to this function. It must return two instances of td.data.Dataset, with the
+    training and validation datasets respectively for the given fold number.
+    :param n_folds: number of folds (k) required for the k-fold cross-validation.
+    :param log_dir: base name for the directory where to save logs for Tensorboard. Logs for fold XX are saved in
+    <log_dir>-fold<nn>, where <nn> is the fold number. Logs for the overall validation, that is the average of the k
+    validations, are saved in <log_dir>-xval.
+    :param log_level: logging level for this funciton, as defined in package `logging`.
+    :param kwargs: parameters to be passed to resumable_fit() for the training and validation of each fold.
+    :return: a 2-tuple; the first element of the tuple is a list of k History objects, each with a record of the
+    computation on fold k, as returned by tf.Keras.Model.fit(). The second element is a pd.DataFrame with the averages
+    of validation metrics per epoch, averaged across folds.
+    """
+    n_folds = len(train_datasets)
+    assert n_folds < 100
+    assert len(val_datasets) == n_folds
+    # assert kwargs.get('x') is None
+    # assert kwargs.get('validation_data') is None
+
+    logger = make_logger(name='k_fold_resumable_fit', log_level=log_level)
+
+    state_file_path = f'{comp_dir}/{project}/comp_state.pickle'
+    current_fold = 0
+    histories = []
+
+    # Restore the state of the k-fold cross validation from file, if the file is available
+    if Path(state_file_path).is_file():
+        with open(state_file_path, 'br') as pickle_f:
+            pickled = pickle.load(pickle_f)
+        current_fold = pickled['fold'] + 1
+        histories = pickled['histories']
+        logger.info(
+            f"Reloaded the state of previous k-fold cross validation from {state_file_path} - {pickled['fold']} folds already computed")
+    else:
+        logger.info(f"State of k-fold cross validation will be saved in {state_file_path}")
+
+    # saved_model_fname = f'{comp_dir}/{stem}_orig.h5'
+
+    for fold in range(current_fold, n_folds):
+        model = model_maker(hp)
+        if fold == 0:
+            logger.info(f'Starting cross-validation on fold 0 for model {model.name}')
+        else:
+            logger.info(f'Resuming cross-validation on fold {fold} for model {model.name}')
+
+        log_dir = '{}/{}/fold-{:02d}'.format(comp_dir, project, fold)
+        tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
+                                                        histogram_freq=1,
+                                                        profile_batch=0)
+        callbacks = kwargs.get('callbacks', [])
+        callbacks.append(tensorboard_cb)
+        kwargs['callbacks'] = callbacks
+        history = model.fit(x=train_datasets[fold], validation_data=val_datasets[fold], **kwargs)
+        histories.append(history.history)
+        # Update the state of the k-fold x-validation as saved in the pickle
+        with open(state_file_path + '.tmp', 'bw') as pickle_f:
+            pickle_this = {'fold': fold, 'histories': histories}
+            pickle.dump(obj=pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
+            keep_last_two_files(state_file_path)
+
+    logger.info(f"All {n_folds} folds of the cross-validation have been processed")
+    histories_df = None
+    for i, history in enumerate(histories):
+        if histories_df is None:
+            histories_df = pd.DataFrame(history)
+            histories_df['fold'] = i
+            histories_df['epoch'] = histories_df.index
+        else:
+            history_df = pd.DataFrame(history)
+            history_df['fold'] = i
+            history_df['epoch'] = history_df.index
+            histories_df = pd.concat([histories_df, history_df], ignore_index=True)
+
+    means = histories_df.groupby(['epoch']).mean()
+    to_be_dropped = ['fold']
+    """for column in means.columns:
+        if str(column)[:4] != 'val_':
+            to_be_dropped.append(column)"""
+    means.drop(labels=to_be_dropped, axis=1, inplace=True)
+    means['epoch'] = means.index
+
+    file_writer = tf.summary.create_file_writer(log_dir + '-xval')
+    file_writer.set_as_default()  # Note: if you don't set this deafault, nothing will be logged
+    for column in means.columns:
+        for epoch, data in zip(means['epoch'], means[column]):
+            tf.summary.scalar(str(column),
+                              data=data,
+                              step=epoch,
+                              description='Average of validation metrics across folds during k-fold cross validation.')
+
+    means.to_csv(f'{comp_dir}/{project}/xval_report.csv', index=False)
+
+    return histories, means
+
+
 def main():
     metadata = load_metadata()
     # train_metadata2, test_metadata2 = load_metadata2()
@@ -457,15 +610,63 @@ def main():
                     shuffle=False,
                     callbacks=[early_stopping_cb])
 
+    best_ft_model = tuner_ft.get_best_models()[0]
+
+    test_ds = make_pipeline(file_paths=test_metadata['File Path'].to_numpy(),
+                            y=test_metadata['Pneumonia'].to_numpy(),
+                            shuffle=False,
+                            batch_size=val_batch_size)
+
+    test_results = best_ft_model.evaluate(x=test_ds, return_dict=True, verbose=1)
+    print('\nHyper-parameters for the fine-tuned model:')
+    print(tuner_ft.get_best_hyperparameters()[0].values)
+    print('\nTest results on the fine-tuned model:')
+    print(test_results)
+
+    hps = tuner_ft.get_best_hyperparameters()[0].values
+
+    dev_metadata = pd.concat([train_metadata, val_metadata], ignore_index=True)
+    dev_metadata = shuffle_DataFrame(dev_metadata, seed=seed)
+    dev_metadata.reset_index(inplace=True, drop=True)
+    fold_size = int(np.ceil(len(dev_metadata) / n_folds))
+    train_datasets, val_datasets = [], []
+    for fold in range(n_folds):
+        fold_val_metadata = dev_metadata.iloc[fold * fold_size:fold * fold_size + fold_size, :]
+        val_datasets.append(make_pipeline(file_paths=fold_val_metadata['File Path'].to_numpy(),
+                                          y=fold_val_metadata['Pneumonia'].to_numpy(),
+                                          batch_size=val_batch_size,
+                                          shuffle=False))
+        fold_train_metadata1 = dev_metadata.iloc[:fold * fold_size, :]
+        fold_train_metadata2 = dev_metadata.iloc[fold * fold_size + fold_size:, :]
+        fold_train_metadata = pd.concat([fold_train_metadata1, fold_train_metadata2], ignore_index=False)
+        train_datasets.append(make_pipeline(file_paths=fold_train_metadata['File Path'].to_numpy(),
+                                            y=fold_train_metadata['Pneumonia'].to_numpy(),
+                                            batch_size=batch_size,
+                                            shuffle=True,
+                                            seed=seed))
+
+    histories, means = k_fold_resumable_fit(model_maker=model_maker.make_model_DenseNet121,
+                                            hp=hps,
+                                            comp_dir='computations',
+                                            project='xval',
+                                            train_datasets=train_datasets,
+                                            val_datasets=val_datasets,
+                                            log_dir='computations/xval/logs',
+                                            epochs=epochs_ft)
+
+    print(histories)
+    print(means)
+    pass
+
 
 if __name__ == '__main__':
     main()
 
 """ TODO
 can you have TB logs for the tuner trials?
+CHeck if TF warnings "Unresolved object in checkpoint" can be ignored
 Maximise dynamic range during pre-processing
 run overnight
-Try different neural nets
 Modulate the classification threshold to choose an F1 or precision/recall tradeoff (do it with inference only, in a notebook)
 Check "Transfer Learning with Deep Convolutional Neural Network (CNN) for Pneumonia Detection using Chest X-ray"
 https://arxiv.org/abs/2004.06578
