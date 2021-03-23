@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from kerastuner.tuners import Hyperband
 import kerastuner as kt
+from tqdm import tqdm
 
 dataset_path = '/mnt/storage/datasets/chestxray'
 dataset2_path = '/mnt/storage/datasets/chest_xray'
@@ -25,7 +26,8 @@ batch_size = 16
 val_batch_size = 256
 n_classes = 1
 patience = 10
-epochs = 20
+epochs_base = 2
+epochs_ft = 2
 augmentation = 4
 pos_to_neg_rate_on_test = 1.
 
@@ -137,7 +139,35 @@ def make_pipeline(file_paths, y, batch_size, shuffle, seed=None):
     return dataset
 
 
-def make_model(hp):
+def compile_model(model, learning_rate):
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr=learning_rate),
+                  loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
+                  metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'),
+                           tf.keras.metrics.Precision(name='precision'),
+                           tf.keras.metrics.Recall(name='recall'),
+                           tf.keras.metrics.AUC(name='auc')])
+
+
+def make_model_DenseNet121(hp):
+    learning_rate = hp.Float('learning_rate', 1e-5, 1e-3, sampling='log')
+    base_model = tf.keras.applications.DenseNet121(include_top=False,
+                                                   weights='imagenet',
+                                                   input_shape=input_shape,
+                                                   pooling=None,
+                                                   classes=n_classes)
+    base_model.trainable = False
+
+    inputs = tf.keras.layers.Input(shape=input_shape)
+    x = tf.keras.applications.densenet.preprocess_input(inputs)
+    x = base_model(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    outputs = tf.keras.layers.Dense(n_classes, activation='sigmoid')(x)
+    model = tf.keras.Model(inputs, outputs)
+    compile_model(model, learning_rate)
+    return model
+
+
+def make_model_Resnet50(hp):
     learning_rate = hp.Float('learning_rate', 1e-5, 1e-3, sampling='log')
     base_model = tf.keras.applications.ResNet50V2(include_top=False,
                                                   weights='imagenet',
@@ -152,12 +182,7 @@ def make_model(hp):
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     outputs = tf.keras.layers.Dense(n_classes, activation='sigmoid')(x)
     model = tf.keras.Model(inputs, outputs)
-    model.compile(optimizer=tf.keras.optimizers.Adam(lr=learning_rate),
-                  loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
-                  metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'),
-                           tf.keras.metrics.Precision(name='precision'),
-                           tf.keras.metrics.Recall(name='recall'),
-                           tf.keras.metrics.AUC(name='auc')])
+    compile_model(model, learning_rate)
     return model
 
 
@@ -165,7 +190,7 @@ class ModelMaker:
     def __init__(self, tuner):
         self.tuner = tuner
 
-    def make_model(self, hp):
+    def make_model_Resnet50(self, hp):
         learning_rate = hp.Float('learning_rate', 1e-5, 1e-4, sampling='log')
 
         model = self.tuner.get_best_models(num_models=1)[0]
@@ -187,13 +212,33 @@ class ModelMaker:
         for i in range(block_ends[last_frozen_layer] + 1):
             base_model.layers[i].trainable = False
 
-        model.compile(optimizer=tf.keras.optimizers.Adam(lr=learning_rate),
-                      loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
-                      metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'),
-                               tf.keras.metrics.Precision(name='precision'),
-                               tf.keras.metrics.Recall(name='recall'),
-                               tf.keras.metrics.AUC(name='auc')])
+        compile_model(model, learning_rate)
         return model
+
+    def make_model_DenseNet121(self, hp):
+        learning_rate = hp.Float('learning_rate', 1e-5, 1e-4, sampling='log')
+
+        model = self.tuner.get_best_models(num_models=1)[0]
+
+        base_model = model.layers[4]
+        assert base_model.name == 'densenet121'
+        base_model.trainable = True
+        pattern = re.compile('conv(\d)_block(\d)_concat')
+        block_ends = []
+        block_end_names = []
+        for i, layer in enumerate(base_model.layers):
+            match = pattern.match(layer.name)
+            if match is not None:
+                block_ends.append(i)
+                block_end_names.append(layer.name)
+        last_frozen_layer = hp.Int('last_frozen_layer', 0, len(block_ends) - 1)
+
+        for i in range(block_ends[last_frozen_layer]):
+            base_model.layers[i].trainable = False
+
+        compile_model(model, learning_rate)
+        return model
+
 
 
 def show_samples(dataset):
@@ -264,8 +309,10 @@ def augment(metadata, rate, batch_size=16, seed=None):
         dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
         dataset = dataset.prefetch(buffer_size=AUTOTUNE)
 
+        count_expected = int(np.ceil(len(metadata) * rate / batch_size))
+
         ds_iter = iter(dataset)
-        for _ in ds_iter:
+        for _ in tqdm(ds_iter, total=count_expected):
             pass
 
     aug_metadata.drop('File Path', inplace=True, axis=1)
@@ -378,35 +425,35 @@ def main():
     history = model.fit(x=train_ds, validation_data=val_ds, epochs=300, shuffle=False, callbacks=[logs_cb])"""
 
     # TODO what if I use val_loss instead?
-    tuner = Hyperband(make_model,
+    tuner = Hyperband(make_model_DenseNet121,
                       objective=kt.Objective("val_auc", direction="max"),  # Careful to keep the direction updated
-                      max_epochs=epochs,
+                      max_epochs=epochs_base,
                       hyperband_iterations=2,
                       directory='computations',
-                      project_name='base_model-1datasets-aug4-auc')
+                      project_name='base-1dataset-densenet121-auc-auc')
 
     early_stopping_cb = tf.keras.callbacks.EarlyStopping(monitor='val_auc', patience=patience)
 
     tuner.search(x=train_ds,
                  validation_data=val_ds,
-                 epochs=epochs,
+                 epochs=epochs_base,
                  shuffle=False,
                  callbacks=[early_stopping_cb])
 
     model_maker = ModelMaker(tuner)
 
-    tuner_ft = Hyperband(model_maker.make_model,
+    tuner_ft = Hyperband(model_maker.make_model_DenseNet121,
                          objective=kt.Objective("val_auc", direction="max"),  # Careful to keep the direction updated
-                         max_epochs=epochs,
+                         max_epochs=epochs_ft,
                          hyperband_iterations=2,
                          directory='computations',
-                         project_name='fine_tuning-1datasets-aug4-auc')
+                         project_name='fine-1dataset-densenet121-auc-auc')
 
     early_stopping_cb = tf.keras.callbacks.EarlyStopping(monitor='val_auc', patience=patience)
 
     tuner_ft.search(x=train_ds,
                     validation_data=val_ds,
-                    epochs=epochs,
+                    epochs=epochs_ft,
                     shuffle=False,
                     callbacks=[early_stopping_cb])
 
